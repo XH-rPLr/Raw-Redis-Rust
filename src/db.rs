@@ -1,7 +1,9 @@
 use crate::types::*;
+use ahash::RandomState;
 use bytes::Bytes;
+use hashbrown::{HashTable, hash_table::Entry};
 use std::{
-    collections::{BTreeSet, HashMap, hash_map::Entry},
+    collections::BTreeSet,
     mem::take,
     sync::{Arc, Mutex},
 };
@@ -13,15 +15,19 @@ use tracing::{debug, instrument, trace};
 
 const BUFFER: usize = 1024;
 
+type CacheMap = HashTable<(String, CacheValue)>;
+type ExpiryQueue = BTreeSet<(Instant, String)>;
+
 pub enum TrashData {
     Unlinked(Vec<CacheValue>),
-    Flushed((HashMap<String, CacheValue>, BTreeSet<(Instant, String)>)),
+    Flushed((CacheMap, ExpiryQueue)),
 }
 
 #[derive(Default, Debug)]
 struct State {
-    cache: HashMap<String, CacheValue>,
-    expiration_queue: BTreeSet<(Instant, String)>,
+    cache: CacheMap,
+    expiration_queue: ExpiryQueue,
+    hasher: RandomState,
 }
 
 #[derive(Debug)]
@@ -34,60 +40,92 @@ pub struct Db {
 impl State {
     fn new() -> State {
         State {
-            cache: HashMap::new(),
+            cache: HashTable::new(),
             expiration_queue: BTreeSet::new(),
+            hasher: RandomState::new(),
         }
     }
 
     fn insert(&mut self, key: String, value: CacheValue) -> bool {
-        if let Some(old) = self.cache.get(&key)
-            && let Some(old_expiry) = old.expiry
-        {
-            self.expiration_queue.remove(&(old_expiry, key.clone()));
+        let hasher = self.hasher.clone();
+        let hash = hasher.hash_one(&key);
+
+        let key_clone = key.clone();
+        let expiry = value.expiry;
+
+        match self.cache.find_entry(hash, |val| val.0 == key) {
+            Ok(old) => {
+                let removed_entry = old.remove();
+                let old_expiry = removed_entry.0.1.expiry;
+                if let Some(expiry) = old_expiry {
+                    self.expiration_queue.remove(&(expiry, removed_entry.0.0));
+                };
+                removed_entry.1.insert((key, value));
+            }
+            Err(_) => {
+                self.cache
+                    .insert_unique(hash, (key, value), move |val| hasher.hash_one(&val.0));
+            }
         }
 
-        if let Some(expiry) = value.expiry {
-            self.expiration_queue.insert((expiry, key.clone()));
+        if let Some(expiry) = expiry {
+            self.expiration_queue.insert((expiry, key_clone.clone()));
         }
 
         let mut notify = false;
         if let Some((_, first_key)) = self.expiration_queue.first() {
-            notify = first_key == &key;
+            notify = first_key == &key_clone;
         };
-
-        self.cache.insert(key, value);
 
         notify
     }
 
-    fn remove(&mut self, item: (Instant, String)) {
-        if self.expiration_queue.contains(&item) {
-            self.expiration_queue.remove(&item);
-            self.cache.remove(&item.1);
+    // Background sweeper for TTL deletion
+    fn remove(&mut self, key: &str) {
+        let hasher = self.hasher.clone();
+        let hash = hasher.hash_one(key);
+
+        if let Ok(old) = self.cache.find_entry(hash, |val| val.0 == key) {
+            let removed_entry = old.remove().0;
+            if let Some(expiry) = removed_entry.1.expiry {
+                self.expiration_queue.remove(&(expiry, removed_entry.0));
+            }
         }
     }
 
+    // Public API
     fn delete(&mut self, key: &str) -> bool {
-        self.cache
-            .remove(key)
-            .map(|val| {
-                if let Some(expiry) = val.expiry {
-                    self.expiration_queue.remove(&(expiry, key.to_string()));
+        let hasher = self.hasher.clone();
+        let hash = hasher.hash_one(key);
+
+        match self.cache.find_entry(hash, |val| val.0 == key) {
+            Ok(old) => {
+                let removed_entry = old.remove().0;
+                if let Some(expiry) = removed_entry.1.expiry {
+                    self.expiration_queue.remove(&(expiry, removed_entry.0));
                 }
                 true
-            })
-            .unwrap_or_default()
+            }
+            Err(_) => false,
+        }
     }
 
     // In Rust, memory is cleaned up (deallocated) the moment a variable's "owner" is finished with it.
     // This is called a Drop. In unlink: You return the CacheValue. This "moves" the ownership out of the
     // State and into the Db::unlink method. You then move it again into a Vec, and finally move it into the trash_chute.
     fn unlink(&mut self, key: &str) -> Option<CacheValue> {
-        self.cache.remove(key).inspect(|val| {
-            if let Some(expiry) = val.expiry {
-                self.expiration_queue.remove(&(expiry, key.to_string()));
+        let hasher = self.hasher.clone();
+        let hash = hasher.hash_one(key);
+
+        if let Ok(old) = self.cache.find_entry(hash, |val| val.0 == key) {
+            let removed_entry = old.remove().0;
+            if let Some(expiry) = removed_entry.1.expiry {
+                self.expiration_queue.remove(&(expiry, removed_entry.0));
             }
-        })
+            Some(removed_entry.1)
+        } else {
+            None
+        }
     }
 }
 
@@ -108,21 +146,23 @@ impl Db {
     #[instrument(level = "trace", skip(self))]
     pub fn get(&self, key: String) -> Option<RedisData> {
         let mut guard = self.state.lock().unwrap();
+        let hasher = guard.hasher.clone();
+        let hash = hasher.hash_one(&key);
 
         let mut to_remove = None;
-        let result = if let Some(cache_value) = guard.cache.get(&key) {
-            if cache_value.is_expired() {
-                to_remove = cache_value.expiry;
+        let result = if let Some(cache_value) = guard.cache.find(hash, |val| val.0 == key) {
+            if cache_value.1.is_expired() {
+                to_remove = cache_value.1.expiry;
                 None
             } else {
-                Some(cache_value.value.clone())
+                Some(cache_value.1.value.clone())
             }
         } else {
             None
         };
 
-        if let Some(expiry) = to_remove {
-            guard.remove((expiry, key));
+        if let Some(_expiry) = to_remove {
+            guard.remove(&key);
         }
 
         result
@@ -195,30 +235,39 @@ impl Db {
     pub fn rpush(&self, key: String, values: Vec<Bytes>) -> Option<usize> {
         let mut to_remove = None;
         let mut guard = self.state.lock().expect("Failed to lock DB");
-        if let Some(cache_value) = guard.cache.get(&key)
-            && cache_value.is_expired()
-        {
-            to_remove = cache_value.expiry;
-        };
 
-        if let Some(expiry) = to_remove {
-            guard.remove((expiry, key.clone()));
+        let hasher = guard.hasher.clone();
+        let hash = hasher.hash_one(&key);
+
+        if let Some(cache_value) = guard.cache.find(hash, |val| val.0 == key)
+            && cache_value.1.is_expired()
+        {
+            to_remove = cache_value.1.expiry;
         }
 
-        let entry = guard.cache.entry(key.clone());
+        if let Some(_expiry) = to_remove {
+            guard.remove(&key);
+        }
+
+        let entry = guard
+            .cache
+            .entry(hash, |val| val.0 == key, |val| hasher.hash_one(&val.0));
 
         match entry {
             Entry::Vacant(e) => {
                 let len = values.len();
-                e.insert(CacheValue {
-                    value: RedisData::List(values),
-                    expiry: None,
-                });
+                e.insert((
+                    key,
+                    CacheValue {
+                        value: RedisData::List(values),
+                        expiry: None,
+                    },
+                ));
                 Some(len)
             }
             Entry::Occupied(mut e) => {
                 let entry_val = e.get_mut();
-                match &mut entry_val.value {
+                match &mut entry_val.1.value {
                     RedisData::List(list) => {
                         list.extend(values);
                         Some(list.len())
@@ -253,7 +302,7 @@ pub async fn purge_expired_tasks(db: Arc<Db>, mut shutdown_complete_rx: Receiver
 
             {
                 let mut state_guard = db.state.lock().expect("Failed to lock DB");
-                state_guard.remove(item);
+                state_guard.remove(&item.1);
             }
         } else {
             tokio::select! {
