@@ -1,0 +1,35 @@
+services:
+  # Rust app
+  redis-app:
+    build: .
+    environment:
+      - REDIS_BIND_ADDR=0.0.0.0:6380
+      - API_BIND_ADDR=0.0.0.0:9092
+      - RUST_LOG=info
+    # Ports mapping, tunneling ports directly to localhost.
+    ports:
+      - "6380:6380"
+      - "9092:9092"
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+
+  # This is the benchmarker
+  benchmarker:
+    image: redislabs/memtier_benchmark:latest
+    # This ensures the app starts before the benchmark begins
+    depends_on:
+      - redis-app
+    # 'redis-app' is the internal hostname used to talk to the other container
+    command: >
+      -s redis-app 
+      -p 6380
+      --protocol=redis 
+      --ratio=1:1
+      --requests=1000000
+      --data-size=512
+      --hide-histogram
+      --threads=4
+      --clients=50

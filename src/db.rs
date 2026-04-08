@@ -239,12 +239,13 @@ impl Db {
         let hasher = guard.hasher.clone();
         let hash = hasher.hash_one(&key);
 
-        if let Some(cache_value) = guard.cache.find(hash, |val| val.0 == key)
-            && cache_value.1.is_expired()
-        {
-            to_remove = cache_value.1.expiry;
+        if let Some(cache_value) = guard.cache.find(hash, |val| val.0 == key) {
+            if cache_value.1.is_expired() {
+                {
+                    to_remove = cache_value.1.expiry;
+                }
+            }
         }
-
         if let Some(_expiry) = to_remove {
             guard.remove(&key);
         }

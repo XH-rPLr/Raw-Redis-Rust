@@ -4,14 +4,15 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast::Receiver, mpsc::Sender};
 use tracing::instrument;
 
-const API_BIND_ADDR: &str = "127.0.0.1:9091";
+use crate::config::Config;
 
 pub async fn run_api_server(
     _shutdown_complete_tx: Sender<()>,
     mut notify_shutdown_rx: Receiver<()>,
+    config: Config,
 ) {
     let app = Router::<()>::new().route("/metrics", get(metrics_handler));
-    let listener: TcpListener = TcpListener::bind(API_BIND_ADDR).await.unwrap();
+    let listener: TcpListener = TcpListener::bind(config.api_bind_addr).await.unwrap();
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {

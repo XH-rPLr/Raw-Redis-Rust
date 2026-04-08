@@ -18,18 +18,16 @@ use tracing_subscriber::{
 use mini_redis::{
     Connection, ConnectionError, Frame, Result, api,
     cmd::Command,
+    config::Config,
     db::{Db, purge_expired_tasks, run_trash_janitor},
     metrics::{self, ActiveConnectionGuard},
 };
 
-const REDIS_BIND_ADDR: &str = "0.0.0.0:6379";
-const MAX_CONNECTIONS: usize = 1024;
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    let format = fmt::format().with_level(true).with_target(true).compact();
+    let config = Config::load().expect("Failed to load configurations from environment variable");
 
+    let format = fmt::format().with_level(true).with_target(true).compact();
     let filter = EnvFilter::from_default_env();
 
     tracing_subscriber::fmt()
@@ -44,20 +42,21 @@ async fn main() -> Result<()> {
     let db = Arc::new(db);
     let janitor_handle = tokio::spawn(run_trash_janitor(rx));
 
-    let guard = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let guard = Arc::new(Semaphore::new(config.max_connections));
 
-    let addr = REDIS_BIND_ADDR.parse().unwrap();
+    let addr = config.redis_bind_addr.parse().unwrap();
 
     let socket = TcpSocket::new_v4()?;
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
 
-    let listener = socket.listen(1024)?;
+    let listener = socket.listen(config.listen_backlog)?;
 
-    info!("Server listening on port 6379");
+    info!("Server listening on port {}", config.redis_bind_addr);
 
-    let (notify_shutdown_tx, _) = broadcast::channel::<()>(MAX_CONNECTIONS);
-    let (shutdown_complete_tx, mut shutdown_complete_rx) = mpsc::channel::<()>(MAX_CONNECTIONS);
+    let (notify_shutdown_tx, _) = broadcast::channel::<()>(config.max_connections);
+    let (shutdown_complete_tx, mut shutdown_complete_rx) =
+        mpsc::channel::<()>(config.max_connections);
 
     let notify_shutdown_tx_clone = notify_shutdown_tx.clone();
     tokio::spawn(async move {
@@ -76,9 +75,12 @@ async fn main() -> Result<()> {
     let redis_rx = notify_shutdown_tx.subscribe();
     let api_rx = notify_shutdown_tx.subscribe();
 
+    let redis_config = config.clone();
+    let api_config = config.clone();
+
     tokio::select! {
-        _ = run_redis_server(listener, guard, db, redis_tx, redis_rx) => {},
-        _ = api::run_api_server(api_tx, api_rx) => {},
+        _ = run_redis_server(listener, guard, db, redis_tx, redis_rx, redis_config) => {},
+        _ = api::run_api_server(api_tx, api_rx, api_config) => {},
     }
 
     drop(notify_shutdown_tx);
@@ -96,6 +98,7 @@ async fn run_redis_server(
     db: Arc<Db>,
     shutdown_complete_tx: Sender<()>,
     mut notify_shutdown_rx: Receiver<()>,
+    config: Config,
 ) -> Result<()> {
     let mut timeout = Duration::from_millis(1);
 
@@ -118,10 +121,18 @@ async fn run_redis_server(
 
                 let db_ref = db.clone();
                 let guard_clone = guard.clone();
+                let config_clone = config.clone();
                 tokio::spawn(async move {
                     if let Ok(_permit) = guard_clone.acquire_owned().await {
                         let _guard = ActiveConnectionGuard::new();
-                        let _ = handle_client(stream, db_ref, _rx_clone, _tx_clone).await;
+                        let _ = handle_client(
+                            stream,
+                            db_ref,
+                            _rx_clone,
+                            _tx_clone,
+                            config_clone.idle_timeout(),
+                        )
+                        .await;
                     };
                 });
             }
@@ -158,12 +169,13 @@ async fn handle_client(
     db: Arc<Db>,
     mut notify_shutdown_rx: Receiver<()>,
     _shutdown_complete_tx: Sender<()>,
+    idle_timeout: Duration,
 ) -> Result<()> {
     let mut connection = Connection::new(stream);
     loop {
         let (timeout_result, parse_timer) = tokio::select! {
             _ = notify_shutdown_rx.recv() => { return Ok(()); },
-            timeout_result = timeout(IDLE_TIMEOUT, connection.read_frame()) => {
+            timeout_result = timeout(idle_timeout, connection.read_frame()) => {
                 let _parse_timer = metrics::PARSE_LATENCY.start_timer();
                 (timeout_result, _parse_timer)
             }
